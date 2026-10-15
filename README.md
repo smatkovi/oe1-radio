@@ -123,18 +123,46 @@ bytes through the proxy, which separates "the proxy serves audio" from
 "gstreamer plays it":
 
 ```sh
-python /home/user/abspielprobe.py ondemand    # 7 Tage
-python /home/user/abspielprobe.py live        # Livestream
+sh tests/endpunkte.sh                      # legt u.a. die Sendungsnummer ab
+python tests/abspielprobe.py ondemand      # 7 Tage
+python tests/abspielprobe.py live          # Livestream
 ```
+
+Both run **on the device** (Python 2.6 with PySide). `abspielprobe.py` takes
+the broadcast id as a third argument and otherwise reads the one
+`endpunkte.sh` left in `/home/user/firstid.txt`; a second argument overrides
+which script to load, so an unreleased build can be probed before it is
+packaged.
 
 On the N950 it reports ~2.5 MB in ten seconds for a catch-up broadcast and
 ~420 KB for the live stream.
 
 ## What it costs on the device
 
-Measured on the N950 (OMAP3630, 1 GB RAM) — see the repository history for the
-numbers behind a Rust rewrite, which would move far less than it looks: most
-of the resident memory is the Python and Qt runtime, not this app's logic.
+Measured on the N950 (OMAP3630, 1 GB RAM, `CLK_TCK` 100):
+
+| | |
+| --- | --- |
+| start until QML is loaded | **8 s**, 5.0 s of CPU |
+| playing, steady state | **2 % of one core** (41 ticks in 15 s) |
+| resident memory | **73 MB**, 2 threads |
+| an empty PySide process with a `QDeclarativeView` | 30 MB |
+| `sr`, a sibling PySide app in the same class | 63 MB |
+
+So the runtime floor is about 30 MB; the rest is this app's QML interface, the
+parsed programme data and the proxy. Nothing is expensive while it plays — the
+cost is the eight seconds before the interface appears.
+
+**Would Rust be faster?** Not where it hurts. Steady state is already 2 %, so
+there is nothing to win there, and the 5 s of startup CPU is shared between
+things Rust would replace (importing Python and PySide, turning 129 KB and
+361 KB of JSON into dicts) and things it would not (compiling the 67 KB
+`main.qml`, which Qt does either way). There is also no Rust binding for
+Qt 4.7 / QtQuick 1.1, so a rewrite means the shape the sibling projects
+already use: a Rust helper for fetching and the loopback proxy behind a Qt 4
+shell. The better argument for doing it is not speed but that a `rustls`
+helper would drop the dependency on `/opt/wunderw/bin/wget`, which only exists
+on a device that has had the newer OpenSSL installed — a stock N9 has not.
 
 ## License
 

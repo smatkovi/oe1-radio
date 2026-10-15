@@ -5,8 +5,27 @@ import imp, sys, os, subprocess, time
 from PySide.QtCore import QTimer
 from PySide.QtGui import QApplication
 
+USAGE = """Aufruf (auf dem Geraet):
+
+    python abspielprobe.py ondemand|live [skript] [sendungsnummer]
+
+skript ist die zu pruefende Fassung, voreingestellt die installierte
+/opt/oe1-radio/oe1radio -- so laesst sich ein Bau pruefen, bevor er paketiert
+ist. Die Sendungsnummer braucht nur 'ondemand'; ohne sie wird die genommen,
+die tests/endpunkte.sh in /home/user/firstid.txt abgelegt hat.
+"""
+
+if len(sys.argv) < 2 or sys.argv[1] not in ('ondemand', 'live'):
+    sys.stderr.write(USAGE)
+    sys.exit(2)
+
+SKRIPT = sys.argv[2] if len(sys.argv) > 2 else '/opt/oe1-radio/oe1radio'
+if not os.path.exists(SKRIPT):
+    sys.stderr.write("kein Skript: %s\n" % SKRIPT)
+    sys.exit(2)
+
 app = QApplication(sys.argv)
-m = imp.load_source('oe1mod', '/home/user/oe1radio_test')
+m = imp.load_source('oe1mod', SKRIPT)
 print "stdout wrapper in module: %s" % type(m.sys.stdout).__name__
 
 helper = m.Oe1Helper()
@@ -55,7 +74,15 @@ def pull():
 
 MODE = sys.argv[1]
 if MODE == 'ondemand':
-    bid = int(open('/home/user/firstid.txt').read().strip())
+    if len(sys.argv) > 3:
+        bid = int(sys.argv[3])
+    else:
+        quelle = '/home/user/firstid.txt'
+        if not os.path.exists(quelle):
+            sys.stderr.write("%s fehlt -- erst tests/endpunkte.sh laufen "
+                             "lassen oder die Nummer angeben\n" % quelle)
+            sys.exit(2)
+        bid = int(open(quelle).read().strip())
     print "calling getPlaybackUrl(%d)" % bid
     helper.getPlaybackUrl(bid)
 else:
