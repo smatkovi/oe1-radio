@@ -1,0 +1,1957 @@
+#!/usr/bin/python
+# -*- coding: utf-8 -*-
+"""
+Ö1 Radio App for MeeGo Harmattan
+Version 1.5.43 - stdout/stderr auf UTF-8 festgenagelt (Launcher setzt kein LANG)
+"""
+
+import sys
+import json
+import subprocess
+import threading
+from datetime import datetime, timedelta
+
+from PySide.QtCore import QObject, Slot, Signal, QTimer, QUrl, Property
+from PySide.QtGui import QApplication
+from PySide.QtDeclarative import QDeclarativeView
+
+
+# --- Ausgabe immer in UTF-8 ------------------------------------------------
+# Harmattans Startansicht gibt der App *kein* LANG mit, also ist
+# sys.stdout.encoding None und Python nimmt ASCII. Jedes `print u"...Ö..."`
+# wirft dann UnicodeEncodeError. Im Hauptfaden hat das die App eine Sekunde
+# nach dem Antippen beendet; in den Arbeitsfaeden (Sendungstitel wie
+# u"Ö1 Frühjournal") riss es still den Faden ab, bevor playUrl gesetzt war --
+# daher ging weder Livestream noch 7-Tage. Einmal umhuellen deckt alle
+# 107 print-Anweisungen und traceback.print_exc() ab.
+class _Utf8Stream(object):
+    """Schreibt unicode als UTF-8 weiter und laesst Bytes unangetastet."""
+
+    def __init__(self, stream):
+        self._stream = stream
+
+    def write(self, data):
+        if isinstance(data, unicode):
+            data = data.encode('utf-8', 'replace')
+        self._stream.write(data)
+
+    def writelines(self, lines):
+        for line in lines:
+            self.write(line)
+
+    def flush(self):
+        self._stream.flush()
+
+    def __getattr__(self, name):
+        return getattr(self._stream, name)
+
+
+if getattr(sys.stdout, 'encoding', None) is None:
+    sys.stdout = _Utf8Stream(sys.stdout)
+if getattr(sys.stderr, 'encoding', None) is None:
+    sys.stderr = _Utf8Stream(sys.stderr)
+
+# API URLs
+API_OE1 = "https://audioapi.orf.at/oe1/api/json/5.0"
+API_RADIOTHEK = "https://audioapi.orf.at/radiothek/api/2.0"
+API_RADIOTHEK_PUBLIC = "https://audioapi.orf.at/radiothek/api/public/2.0"
+
+# HTTP statt HTTPS für Loopstream (SSL nicht verfügbar in QtMultimediaKit)
+LOOPSTREAM_BASE = "https://loopstream01.apa.at/?channel=oe1&shoutcast=0&player=radiothek&id="
+
+# Stream URLs
+STREAM_URLS = {
+    'low': 'http://ors-sn10.ors-shoutcast.at/oe1-q1a',
+    'medium': 'http://ors-sn10.ors-shoutcast.at/oe1-q2a',
+    'high': 'http://ors-sn10.ors-shoutcast.at/oe1-q2a'  # HLS nicht verwendbar, fallback
+}
+
+
+class Oe1Helper(QObject):
+    """Backend for Ö1 Radio App"""
+    
+    # Signals
+    currentShowChanged = Signal()
+    scheduleChanged = Signal()
+    onDemandDaysChanged = Signal()
+    onDemandBroadcastsChanged = Signal()
+    podcastsChanged = Signal()
+    podcastEpisodesChanged = Signal()
+    searchResultsChanged = Signal()
+    playUrlChanged = Signal()
+    errorOccurred = Signal()
+    sleepTimerTick = Signal()
+    sleepTimerFinished = Signal()
+    broadcastInfoChanged = Signal()
+    downloadProgressChanged = Signal()
+    downloadFinished = Signal()
+    
+    def __init__(self, parent=None):
+        super(Oe1Helper, self).__init__(parent)
+        self._pending = {}
+        self._sleepTimerRemaining = 0
+        self._broadcastCache = {}
+        self._downloadProc = None  # Hintergrund-Download Prozess
+        self._proxySocket = None   # Proxy Server Socket
+        self._proxyRunning = False
+        self._currentBroadcastId = 0  # ID der aktuellen Sendung für Timeshift
+        
+        # Download state
+        self._saveDownloadProc = None
+        self._saveDownloadFile = ''
+        self._saveDownloadSize = 0
+        self._saveDownloadProgress = 0
+        self._saveDownloadActive = False
+        self._podcastProc = None  # Podcast-Download Prozess
+        
+        # Data properties
+        self._showJson = '{}'
+        self._scheduleJson = '[]'
+        self._daysJson = '[]'
+        self._broadcastsJson = '[]'
+        self._podcastsJson = '[]'
+        self._episodesJson = '[]'
+        self._resultsJson = '[]'
+        self._broadcastInfoJson = '{}'
+        self._playUrl = ''
+        self._errorMsg = ''
+        self._timerRemaining = 0
+        self._streamDuration = 0  # Berechnete Dauer in ms
+        
+        self.sleepTimer = QTimer(self)
+        self.sleepTimer.timeout.connect(self._sleepTimerUpdate)
+        
+        # Download progress timer
+        self.downloadTimer = QTimer(self)
+        self.downloadTimer.timeout.connect(self._checkDownloadProgress)
+    
+    # Properties
+    def _getShowJson(self):
+        return self._showJson
+    showJson = Property(str, _getShowJson, notify=currentShowChanged)
+    
+    def _getScheduleJson(self):
+        return self._scheduleJson
+    scheduleJson = Property(str, _getScheduleJson, notify=scheduleChanged)
+    
+    def _getDaysJson(self):
+        return self._daysJson
+    daysJson = Property(str, _getDaysJson, notify=onDemandDaysChanged)
+    
+    def _getBroadcastsJson(self):
+        return self._broadcastsJson
+    broadcastsJson = Property(str, _getBroadcastsJson, notify=onDemandBroadcastsChanged)
+    
+    def _getPodcastsJson(self):
+        return self._podcastsJson
+    podcastsJson = Property(str, _getPodcastsJson, notify=podcastsChanged)
+    
+    def _getEpisodesJson(self):
+        return self._episodesJson
+    episodesJson = Property(str, _getEpisodesJson, notify=podcastEpisodesChanged)
+    
+    def _getResultsJson(self):
+        return self._resultsJson
+    resultsJson = Property(str, _getResultsJson, notify=searchResultsChanged)
+    
+    def _getBroadcastInfoJson(self):
+        return self._broadcastInfoJson
+    broadcastInfoJson = Property(str, _getBroadcastInfoJson, notify=broadcastInfoChanged)
+    
+    def _getUrl(self):
+        return self._playUrl
+    url = Property(str, _getUrl, notify=playUrlChanged)
+    
+    def _getMessage(self):
+        return self._errorMsg
+    message = Property(str, _getMessage, notify=errorOccurred)
+    
+    def _getRemaining(self):
+        return self._timerRemaining
+    remaining = Property(int, _getRemaining, notify=sleepTimerTick)
+    
+    def _getDownloadProgress(self):
+        return self._saveDownloadProgress
+    downloadProgress = Property(int, _getDownloadProgress, notify=downloadProgressChanged)
+    
+    def _getDownloadActive(self):
+        return self._saveDownloadActive
+    downloadActive = Property(bool, _getDownloadActive, notify=downloadProgressChanged)
+    
+    def _getDownloadFile(self):
+        return self._saveDownloadFile
+    downloadFilePath = Property(str, _getDownloadFile, notify=downloadProgressChanged)
+    
+    def _getStreamDuration(self):
+        return self._streamDuration
+    streamDuration = Property(int, _getStreamDuration, notify=playUrlChanged)
+    
+    def _fetchUrl(self, url):
+        """Fetch URL using wget from wunderw (SSL support)"""
+        try:
+            # Verwende wunderw wget mit modernem SSL
+            wget_path = '/opt/wunderw/bin/wget'
+            proc = subprocess.Popen(
+                [wget_path, '-q', '-O', '-', '--timeout=15', url],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE
+            )
+            stdout, stderr = proc.communicate()
+            return stdout
+        except Exception as e:
+            print u"Fetch error: %s" % e
+            return None
+    
+    # ==================== CURRENT SHOW ====================
+    
+    @Slot()
+    def refreshCurrentShow(self):
+        """Refresh current show info"""
+        print u"Refreshing current show..."
+        
+        def worker():
+            try:
+                today = datetime.now().strftime('%Y%m%d')
+                url = "%s/broadcasts/%s" % (API_OE1, today)
+                data = self._fetchUrl(url)
+                if data:
+                    self._pending['currentShow'] = data
+            except Exception as e:
+                print u"Current show error: %s" % e
+        
+        t = threading.Thread(target=worker)
+        t.daemon = True
+        t.start()
+        
+        def check():
+            if 'currentShow' in self._pending:
+                data = self._pending.pop('currentShow')
+                self._handleCurrentShow(data)
+            elif t.is_alive():
+                QTimer.singleShot(200, check)
+        
+        QTimer.singleShot(200, check)
+    
+    def _handleCurrentShow(self, data):
+        """Parse current show"""
+        try:
+            response = json.loads(data)
+            broadcasts = response.get('payload', [])
+            now = datetime.utcnow()
+            
+            for b in broadcasts:
+                try:
+                    startStr = b.get('start', '')
+                    endStr = b.get('end', '')
+                    
+                    if startStr and endStr:
+                        start = datetime.strptime(startStr[:19], '%Y-%m-%dT%H:%M:%S')
+                        end = datetime.strptime(endStr[:19], '%Y-%m-%dT%H:%M:%S')
+                        
+                        if start <= now <= end:
+                            # Zeit auf CET umrechnen für Anzeige
+                            startCET = start + timedelta(hours=1)
+                            endCET = end + timedelta(hours=1)
+                            
+                            show = {
+                                'id': b.get('id', 0),
+                                'title': b.get('title', u'Ö1'),
+                                'subtitle': b.get('programTitle', '') or '',
+                                'startTime': startCET.strftime('%H:%M'),
+                                'endTime': endCET.strftime('%H:%M')
+                            }
+                            self._showJson = json.dumps(show)
+                            self._currentBroadcastId = b.get('id', 0)
+                            self.currentShowChanged.emit()
+                            return
+                except:
+                    continue
+            
+            show = {
+                'id': 0,
+                'title': u'Ö1 Livestream',
+                'subtitle': datetime.now().strftime('%H:%M'),
+                'startTime': '',
+                'endTime': ''
+            }
+            self._showJson = json.dumps(show)
+            self._currentBroadcastId = 0
+            self.currentShowChanged.emit()
+            
+        except Exception as e:
+            print u"Parse current show error: %s" % e
+    
+    # ==================== SCHEDULE ====================
+    
+    @Slot()
+    def refreshSchedule(self):
+        """Refresh today's schedule"""
+        print u"Refreshing schedule..."
+        
+        def worker():
+            try:
+                today = datetime.now().strftime('%Y%m%d')
+                url = "%s/broadcasts/%s" % (API_OE1, today)
+                data = self._fetchUrl(url)
+                if data:
+                    self._pending['schedule'] = data
+            except Exception as e:
+                print u"Schedule error: %s" % e
+        
+        t = threading.Thread(target=worker)
+        t.daemon = True
+        t.start()
+        
+        def check():
+            if 'schedule' in self._pending:
+                data = self._pending.pop('schedule')
+                self._handleSchedule(data)
+            elif t.is_alive():
+                QTimer.singleShot(200, check)
+        
+        QTimer.singleShot(200, check)
+    
+    def _handleSchedule(self, data):
+        """Parse schedule"""
+        try:
+            response = json.loads(data)
+            broadcasts = response.get('payload', [])
+            now = datetime.utcnow()
+            
+            schedule = []
+            for b in broadcasts:
+                try:
+                    startStr = b.get('start', '')
+                    endStr = b.get('end', '')
+                    if startStr:
+                        start = datetime.strptime(startStr[:19], '%Y-%m-%dT%H:%M:%S')
+                        start = start + timedelta(hours=1)  # UTC -> CET
+                        
+                        endTime = ''
+                        if endStr:
+                            end = datetime.strptime(endStr[:19], '%Y-%m-%dT%H:%M:%S')
+                            end = end + timedelta(hours=1)
+                            endTime = end.strftime('%H:%M')
+                        
+                        if start > now:
+                            item = {
+                                'id': b.get('id', 0),
+                                'title': b.get('title', ''),
+                                'subtitle': b.get('programTitle', '') or '',
+                                'time': start.strftime('%H:%M'),
+                                'endTime': endTime,
+                                'isOnDemand': b.get('isOnDemand', False)
+                            }
+                            schedule.append(item)
+                            
+                            if len(schedule) >= 10:
+                                break
+                except:
+                    continue
+            
+            self._scheduleJson = json.dumps(schedule)
+            self.scheduleChanged.emit()
+            
+        except Exception as e:
+            print u"Parse schedule error: %s" % e
+    
+    # ==================== ON DEMAND ====================
+    
+    @Slot()
+    def loadOnDemandDays(self):
+        """Generate list of last 7 days with correct field names"""
+        days = []
+        weekdays_de = ['Mo', 'Di', 'Mi', 'Do', 'Fr', 'Sa', 'So']
+        
+        for i in range(7):
+            d = datetime.now() - timedelta(days=i)
+            day = {
+                'date': d.strftime('%Y%m%d'),
+                # QML erwartet 'weekday' und 'displayDate'
+                'weekday': 'Heute' if i == 0 else ('Gestern' if i == 1 else weekdays_de[d.weekday()]),
+                'displayDate': d.strftime('%d.%m.')
+            }
+            days.append(day)
+        
+        self._daysJson = json.dumps(days)
+        self.onDemandDaysChanged.emit()
+    
+    @Slot(str)
+    def loadOnDemandBroadcasts(self, date):
+        """Load broadcasts for a specific day"""
+        print u"Loading on-demand for: %s" % date
+        
+        def worker():
+            try:
+                url = "%s/broadcasts/%s" % (API_OE1, date)
+                data = self._fetchUrl(url)
+                if data:
+                    self._pending['ondemand'] = data
+                    self._broadcastCache[date] = data
+            except Exception as e:
+                print u"OnDemand error: %s" % e
+        
+        t = threading.Thread(target=worker)
+        t.daemon = True
+        t.start()
+        
+        def check():
+            if 'ondemand' in self._pending:
+                data = self._pending.pop('ondemand')
+                self._handleOnDemand(data)
+            elif t.is_alive():
+                QTimer.singleShot(200, check)
+        
+        QTimer.singleShot(200, check)
+    
+    def _handleOnDemand(self, data):
+        """Parse on-demand broadcasts with correct field names"""
+        try:
+            response = json.loads(data)
+            broadcasts = response.get('payload', [])
+            
+            items = []
+            for b in broadcasts:
+                startStr = b.get('start', '')
+                timeStr = ''
+                if startStr:
+                    try:
+                        # Parse ISO (UTC) und addiere 1h für Wien
+                        start = datetime.strptime(startStr[:19], '%Y-%m-%dT%H:%M:%S')
+                        start = start + timedelta(hours=1)  # UTC -> CET
+                        timeStr = start.strftime('%H:%M')
+                    except Exception as e:
+                        print u"Time parse error: %s" % e
+                
+                # QML erwartet 'hasStream' und 'time'
+                item = {
+                    'id': b.get('id', 0),
+                    'title': b.get('title', ''),
+                    'subtitle': b.get('programTitle', '') or '',
+                    'time': timeStr,
+                    'duration': b.get('duration', 0) // 1000 // 60,
+                    'hasStream': b.get('isOnDemand', False)
+                }
+                items.append(item)
+            
+            print u"Found %d on-demand broadcasts" % len(items)
+            self._broadcastsJson = json.dumps(items)
+            self.onDemandBroadcastsChanged.emit()
+            
+        except Exception as e:
+            print u"Parse on-demand error: %s" % e
+    
+    @Slot(int)
+    def getPlaybackUrl(self, broadcastId):
+        """Get stream URL and start local HTTP proxy for streaming with seek support"""
+        print u"Getting playback URL for broadcast: %d" % broadcastId
+        
+        # Prüfe zuerst ob lokale Datei existiert
+        import os
+        import glob
+        download_dir = u"/home/user/MyDocs/Oe1"
+        if os.path.exists(download_dir):
+            # Suche nach Datei mit dieser ID
+            pattern = os.path.join(download_dir, u"%d_*.mp3" % broadcastId)
+            matches = glob.glob(pattern)
+            if matches:
+                local_file = matches[0]
+                print u"Found local file: %s" % local_file
+                self._playUrl = "file://" + local_file
+                self._streamDuration = 0  # Wird vom Player erkannt
+                self.playUrlChanged.emit()
+                return
+        
+        # Stoppe vorherigen Download/Proxy
+        self._stopProxy()
+        
+        def worker():
+            try:
+                # Hole Broadcast-Details mit streams
+                url = "%s/broadcast/%d" % (API_OE1, broadcastId)
+                data = self._fetchUrl(url)
+                if data:
+                    response = json.loads(data)
+                    payload = response.get('payload', {})
+                    streams = payload.get('streams', [])
+                    
+                    if streams:
+                        stream = streams[0]
+                        loopStreamId = stream.get('loopStreamId', '')
+                        
+                        if loopStreamId:
+                            stream_url = "https://loopstream01.apa.at/?channel=oe1&shoutcast=0&id=%s" % loopStreamId
+                            print u"Starting proxy for: %s" % loopStreamId
+                            
+                            # Hole Content-Length zuerst
+                            content_length = self._getContentLength(stream_url)
+                            
+                            # Starte lokalen HTTP-Proxy mit korrekter Länge
+                            proxy_port = self._startProxy(stream_url, content_length)
+                            if proxy_port:
+                                self._pending['playUrl'] = "http://127.0.0.1:%d/stream.mp3" % proxy_port
+                                return
+                    
+                    print u"No streams found for broadcast %d" % broadcastId
+                    self._pending['playUrl'] = ''
+            except Exception as e:
+                print u"Get playback URL error: %s" % e
+                self._pending['playUrl'] = ''
+        
+        t = threading.Thread(target=worker)
+        t.daemon = True
+        t.start()
+        
+        def check():
+            if 'playUrl' in self._pending:
+                url = self._pending.pop('playUrl')
+                if url:
+                    self._playUrl = url
+                    print u"Playing via proxy: %s" % self._playUrl
+                    self.playUrlChanged.emit()
+                else:
+                    self._errorMsg = "Kein Stream verfügbar"
+                    self.errorOccurred.emit()
+            elif t.is_alive():
+                QTimer.singleShot(200, check)
+        
+        QTimer.singleShot(200, check)
+    
+    def _getContentLengthAsync(self, url, callback):
+        """Get content length asynchronously using QTimer polling"""
+        import os
+        import time
+        
+        # Temp-Datei für wget output
+        tmp_file = "/tmp/oe1_spider_%d.txt" % int(time.time())
+        
+        # Starte wget --spider als Hintergrundprozess (non-blocking!)
+        proc = subprocess.Popen(
+            ['/opt/wunderw/bin/wget', '--spider', '-S', '--timeout=10', '--max-redirect=5', url],
+            stdout=open('/dev/null', 'w'),
+            stderr=open(tmp_file, 'w')
+        )
+        
+        print u"[Async] wget --spider started, polling..."
+        
+        def check_spider():
+            if proc.poll() is not None:
+                # wget fertig
+                content_length = None
+                try:
+                    if os.path.exists(tmp_file):
+                        with open(tmp_file, 'r') as f:
+                            for line in f:
+                                line_lower = line.lower()
+                                if 'content-length:' in line_lower:
+                                    parts = line.split(':')
+                                    if len(parts) > 1:
+                                        try:
+                                            cl = int(parts[1].strip().split()[0])
+                                            if cl > 0:
+                                                content_length = cl
+                                        except:
+                                            pass
+                        os.remove(tmp_file)
+                except Exception as e:
+                    print u"[Async] Error reading spider output: %s" % e
+                
+                if content_length:
+                    print u"[Async] Content-Length: %d bytes (%.1f MB)" % (content_length, content_length/1024.0/1024.0)
+                else:
+                    print u"[Async] No Content-Length, using 50MB fallback"
+                    content_length = 50 * 1024 * 1024
+                
+                callback(content_length)
+            else:
+                # Noch nicht fertig, weiter pollen
+                QTimer.singleShot(100, check_spider)
+        
+        QTimer.singleShot(100, check_spider)
+    
+    def _getContentLength(self, url):
+        """Get content length - BLOCKING, only call from worker thread!"""
+        content_length = None
+        
+        try:
+            proc = subprocess.Popen(
+                ['/opt/wunderw/bin/wget', '--spider', '-S', '--timeout=10', '--max-redirect=5', url],
+                stdout=open('/dev/null', 'w'),
+                stderr=subprocess.PIPE
+            )
+            _, stderr = proc.communicate()
+            
+            # Suche letzte Content-Length (case-insensitive, nach allen Redirects)
+            for line in stderr.split('\n'):
+                line_lower = line.lower()
+                if 'content-length:' in line_lower:
+                    # Split bei ':' um case-insensitiv zu sein
+                    parts = line.split(':')
+                    if len(parts) > 1:
+                        try:
+                            cl = int(parts[1].strip().split()[0])
+                            if cl > 0:
+                                content_length = cl
+                        except:
+                            pass
+        except Exception as e:
+            print u"wget --spider error: %s" % e
+        
+        if content_length:
+            print u"Content-Length: %d bytes (%.1f MB)" % (content_length, content_length/1024.0/1024.0)
+            return content_length
+        
+        # WICHTIG: Großer Fallback damit der Player nicht bei EOF verwirrt wird
+        # Der Stream endet sauber wenn wget fertig ist
+        print u"No Content-Length, using 500MB fallback (stream ends at EOF)"
+        return 500 * 1024 * 1024
+    
+    def _startProxyForPodcast(self, url):
+        """Start in-process proxy for podcast (same as 7-Tage)"""
+        print u"Starting in-process podcast proxy for URL (len=%d): %s" % (len(url), url)
+        
+        def worker():
+            try:
+                # Hole Content-Length für Dauer-Berechnung
+                content_length = self._getContentLength(url)
+                if content_length:
+                    duration_ms = int(content_length / 16.0)
+                    print u"Podcast Content-Length: %d, duration: %d ms" % (content_length, duration_ms)
+                else:
+                    content_length = 50 * 1024 * 1024
+                    duration_ms = 0
+                
+                # Nutze den gleichen Proxy wie 7-Tage
+                port = self._startProxy(url, content_length)
+                
+                if port:
+                    self._pending['podcastPort'] = port
+                    self._pending['podcastDuration'] = duration_ms
+                else:
+                    self._pending['podcastPort'] = 0
+                    self._pending['podcastDuration'] = 0
+                    
+            except Exception as e:
+                print u"Podcast proxy error: %s" % e
+                import traceback
+                traceback.print_exc()
+                self._pending['podcastPort'] = 0
+                self._pending['podcastDuration'] = 0
+        
+        t = threading.Thread(target=worker)
+        t.daemon = True
+        t.start()
+        
+        def check():
+            if 'podcastPort' in self._pending:
+                port = self._pending.pop('podcastPort')
+                duration = self._pending.pop('podcastDuration', 0)
+                
+                if port > 0:
+                    self._streamDuration = duration
+                    self._playUrl = "http://127.0.0.1:%d/stream.mp3" % port
+                    print u"Playing podcast via in-process proxy port %d" % port
+                    self.playUrlChanged.emit()
+                else:
+                    self._errorMsg = "Podcast-Proxy fehlgeschlagen"
+                    self.errorOccurred.emit()
+            elif t.is_alive():
+                QTimer.singleShot(200, check)
+        
+        QTimer.singleShot(200, check)
+    
+    def _startProxy(self, upstream_url, content_length=None):
+        """Start local HTTP proxy with file-backed seeking"""
+        import socket
+        import os
+        import time
+        
+        # WICHTIG: Stoppe alten Proxy zuerst!
+        self._stopProxy()
+        
+        # Speichere URL für Seek-Requests
+        self._proxyUpstreamUrl = upstream_url
+        
+        # Verwende übergebene Content-Length oder Fallback
+        if content_length is None:
+            content_length = 50 * 1024 * 1024
+            print u"Using fallback content-length: %d bytes" % content_length
+        
+        # Berechne Dauer: 128kbps = 16000 bytes/sec
+        self._streamDuration = int(content_length * 1000 / 16000)
+        print u"Estimated duration: %d ms (%.1f min)" % (self._streamDuration, self._streamDuration/60000.0)
+        
+        # Cache-Verzeichnis in MyDocs (hat genug Platz, /tmp ist nur 4MB!)
+        cache_dir = "/home/user/MyDocs/.oe1cache"
+        if not os.path.exists(cache_dir):
+            try:
+                os.makedirs(cache_dir)
+            except:
+                cache_dir = "/home/user/MyDocs"
+        
+        # Lösche alte Cache-Dateien zuerst
+        if os.path.exists(cache_dir):
+            for f in os.listdir(cache_dir):
+                if f.startswith('stream_') and f.endswith('.mp3'):
+                    try:
+                        os.remove(os.path.join(cache_dir, f))
+                    except:
+                        pass
+        
+        # Unique Temp-Datei mit Timestamp
+        self._proxyTempFile = os.path.join(cache_dir, "stream_%d.mp3" % int(time.time()))
+        
+        # Starte Hintergrund-Download in Datei (ohne PIPE um Buffer-Blockade zu vermeiden)
+        self._downloadProc = subprocess.Popen(
+            ['/opt/wunderw/bin/wget', '-q', '-O', self._proxyTempFile, self._proxyUpstreamUrl],
+            stdout=open('/dev/null', 'w'),
+            stderr=open('/dev/null', 'w')
+        )
+        print u"Background download started to: %s" % self._proxyTempFile
+        
+        # KEINE Wartezeit hier - handle_client wartet auf Daten
+        # Das macht die UI reaktionsfähig
+        
+        # Finde freien Port
+        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        sock.bind(('127.0.0.1', 0))
+        port = sock.getsockname()[1]
+        sock.listen(5)
+        
+        self._proxySocket = sock
+        self._proxyRunning = True
+        self._proxyContentLength = content_length
+        
+        def handle_client(client):
+            """Handle client with server-side seeking"""
+            try:
+                # Lese HTTP Request
+                request = ''
+                try:
+                    request = client.recv(4096)
+                except:
+                    pass
+                
+                # Parse Range Header
+                range_start = 0
+                if 'Range:' in request:
+                    import re
+                    match = re.search(r'Range:\s*bytes=(\d+)-', request)
+                    if match:
+                        range_start = int(match.group(1))
+                        print u"Seek requested to: %d bytes" % range_start
+                
+                # Warte auf initiale Daten (falls noch nicht vorhanden)
+                if range_start == 0:
+                    for _ in range(50):  # Max 5 Sekunden
+                        if os.path.exists(self._proxyTempFile):
+                            size = os.path.getsize(self._proxyTempFile)
+                            if size >= 100000:  # 100KB
+                                print u"Initial buffer ready: %d bytes" % size
+                                break
+                        time.sleep(0.1)
+                
+                file_size = 0
+                use_existing_file = False
+                
+                # Prüfe ob wir aus existierender Datei lesen können
+                if os.path.exists(self._proxyTempFile):
+                    file_size = os.path.getsize(self._proxyTempFile)
+                    # Nutze existierende Datei nur wenn Position schon geladen
+                    if file_size > range_start + 100000:
+                        use_existing_file = True
+                        print u"Using cached data (have %d bytes)" % file_size
+                
+                total_size = self._proxyContentLength or file_size
+                
+                if range_start > 0 and not use_existing_file:
+                    # Seek zu Position die noch nicht geladen ist
+                    # Starte neuen wget mit Range-Header
+                    print u"Starting new download from position %d" % range_start
+                    
+                    # Temp-Datei für diesen Seek
+                    seek_file = self._proxyTempFile + ".seek"
+                    
+                    # wget mit Range-Header (ohne PIPE)
+                    seek_proc = subprocess.Popen(
+                        ['/opt/wunderw/bin/wget', '-q', '-O', seek_file,
+                         '--header=Range: bytes=%d-' % range_start,
+                         self._proxyUpstreamUrl],
+                        stdout=open('/dev/null', 'w'),
+                        stderr=open('/dev/null', 'w')
+                    )
+                    
+                    # Warte auf erste Daten
+                    for _ in range(50):
+                        time.sleep(0.2)
+                        if os.path.exists(seek_file) and os.path.getsize(seek_file) > 50000:
+                            break
+                    
+                    if not os.path.exists(seek_file):
+                        print u"Seek file not created"
+                        seek_proc.terminate()
+                        return
+                    
+                    # HTTP Response Header (206 Partial Content)
+                    header = "HTTP/1.1 206 Partial Content\r\n"
+                    header += "Content-Type: audio/mpeg\r\n"
+                    header += "Content-Length: %d\r\n" % (total_size - range_start)
+                    header += "Content-Range: bytes %d-%d/%d\r\n" % (range_start, total_size - 1, total_size)
+                    header += "Accept-Ranges: bytes\r\n"
+                    header += "Connection: close\r\n\r\n"
+                    
+                    try:
+                        client.sendall(header)
+                    except:
+                        seek_proc.terminate()
+                        if os.path.exists(seek_file):
+                            os.remove(seek_file)
+                        return
+                    
+                    # Stream aus Seek-Datei
+                    bytes_sent = 0
+                    target = total_size - range_start
+                    with open(seek_file, 'rb') as f:
+                        while self._proxyRunning and bytes_sent < target:
+                            # Warte auf Daten
+                            sz = os.path.getsize(seek_file)
+                            wait_count = 0
+                            while sz <= bytes_sent and wait_count < 50:
+                                if seek_proc.poll() is not None:
+                                    break
+                                time.sleep(0.1)
+                                sz = os.path.getsize(seek_file)
+                                wait_count += 1
+                            
+                            chunk = f.read(65536)
+                            if chunk:
+                                try:
+                                    client.sendall(chunk)
+                                    bytes_sent += len(chunk)
+                                except:
+                                    break
+                            elif seek_proc.poll() is not None:
+                                break
+                            else:
+                                time.sleep(0.1)
+                    
+                    print u"Seek stream sent %d bytes" % bytes_sent
+                    seek_proc.terminate()
+                    try:
+                        os.remove(seek_file)
+                    except:
+                        pass
+                    return
+                
+                # Normaler Stream ohne Seek oder aus Cache
+                # HTTP Response Header
+                if range_start > 0:
+                    print u"Sending 206 response for cached seek to %d" % range_start
+                    header = "HTTP/1.1 206 Partial Content\r\n"
+                    header += "Content-Type: audio/mpeg\r\n"
+                    header += "Content-Length: %d\r\n" % (total_size - range_start)
+                    header += "Content-Range: bytes %d-%d/%d\r\n" % (range_start, total_size - 1, total_size)
+                else:
+                    header = "HTTP/1.1 200 OK\r\n"
+                    header += "Content-Type: audio/mpeg\r\n"
+                    header += "Content-Length: %d\r\n" % total_size
+                
+                header += "Accept-Ranges: bytes\r\n"
+                header += "Connection: close\r\n\r\n"
+                
+                try:
+                    client.sendall(header)
+                    print u"Header sent successfully"
+                except Exception as e:
+                    print u"Error sending header: %s" % e
+                    return
+                
+                # Stream aus Datei
+                with open(self._proxyTempFile, 'rb') as f:
+                    f.seek(range_start)
+                    bytes_sent = 0
+                    target = total_size - range_start
+                    download_done = False
+                    all_data_sent = False
+                    print u"Starting to stream from pos %d, target %d bytes" % (range_start, target)
+                    
+                    while self._proxyRunning:
+                        current_pos = range_start + bytes_sent
+                        
+                        # Prüfe ob Download fertig ist
+                        if self._downloadProc and self._downloadProc.poll() is not None:
+                            download_done = True
+                        
+                        # Warte auf mehr Daten wenn nötig
+                        if not download_done:
+                            file_size = os.path.getsize(self._proxyTempFile)
+                            wait_count = 0
+                            while self._proxyRunning and file_size <= current_pos and wait_count < 50:
+                                time.sleep(0.1)
+                                file_size = os.path.getsize(self._proxyTempFile)
+                                if self._downloadProc and self._downloadProc.poll() is not None:
+                                    download_done = True
+                                    break
+                                wait_count += 1
+                        
+                        chunk = f.read(65536)
+                        if chunk:
+                            try:
+                                client.sendall(chunk)
+                                bytes_sent += len(chunk)
+                            except Exception as e:
+                                print u"Send error after %d bytes: %s" % (bytes_sent, e)
+                                break
+                        else:
+                            # Keine Daten mehr zu lesen
+                            if download_done and not all_data_sent:
+                                print u"All data sent: %d bytes, keeping connection open" % bytes_sent
+                                all_data_sent = True
+                            # Warte statt zu schließen - Player spielt weiter
+                            time.sleep(0.5)
+                    
+                    print u"Stream ended, sent %d bytes total" % bytes_sent
+                        
+            except Exception as e:
+                print u"Client error: %s" % e
+                import traceback
+                traceback.print_exc()
+            finally:
+                try:
+                    client.close()
+                except:
+                    pass
+        
+        def proxy_thread():
+            import select
+            sock.setblocking(False)
+            while self._proxyRunning:
+                try:
+                    ready, _, _ = select.select([sock], [], [], 0.5)
+                    if ready:
+                        client, _ = sock.accept()
+                        t = threading.Thread(target=handle_client, args=(client,))
+                        t.daemon = True
+                        t.start()
+                except:
+                    pass
+        
+        t = threading.Thread(target=proxy_thread)
+        t.daemon = True
+        t.start()
+        
+        print u"Proxy started on port %d (file-backed)" % port
+        return port
+    
+    def _stopProxy(self):
+        """Stop proxy and download"""
+        self._proxyRunning = False
+        
+        if hasattr(self, '_downloadProc') and self._downloadProc:
+            try:
+                self._downloadProc.terminate()
+            except:
+                pass
+            self._downloadProc = None
+        
+        # Stoppe Podcast-Download
+        if hasattr(self, '_podcastProc') and self._podcastProc:
+            try:
+                self._podcastProc.terminate()
+            except:
+                pass
+            self._podcastProc = None
+        
+        if hasattr(self, '_proxySocket') and self._proxySocket:
+            try:
+                self._proxySocket.close()
+            except:
+                pass
+            self._proxySocket = None
+        
+        # Lösche Temp-Datei
+        if hasattr(self, '_proxyTempFile') and self._proxyTempFile:
+            import os
+            try:
+                if os.path.exists(self._proxyTempFile):
+                    os.remove(self._proxyTempFile)
+            except:
+                pass
+            self._proxyTempFile = None
+        
+        # Lösche FIFO-Dateien
+        import os
+        cache_dir = "/home/user/.oe1cache"
+        if os.path.exists(cache_dir):
+            for f in os.listdir(cache_dir):
+                if f.endswith('.fifo'):
+                    try:
+                        os.remove(os.path.join(cache_dir, f))
+                    except:
+                        pass
+    
+    @Slot(str)
+    def playDirectUrl(self, url):
+        """Play direct URL via proxy (for podcast episodes) - async"""
+        print u"Playing podcast URL: %s" % url[:60]
+        self._startProxyForPodcast(url)
+    
+    @Slot(str, str)
+    def playLocalOrStream(self, url, title):
+        """Play local file if exists, otherwise stream via proxy (non-blocking)"""
+        import os
+        
+        # Bereinige Titel für Dateisuche
+        if isinstance(title, str):
+            title = title.decode('utf-8', 'ignore')
+        safe_title = title.replace(u'/', u'-').replace(u':', u'-').replace(u'?', u'').replace(u'"', u'')
+        safe_title = safe_title.replace(u'ä', u'ae').replace(u'ö', u'oe').replace(u'ü', u'ue')
+        safe_title = safe_title.replace(u'Ä', u'Ae').replace(u'Ö', u'Oe').replace(u'Ü', u'Ue')
+        safe_title = safe_title.replace(u'ß', u'ss')
+        
+        download_dir = u"/home/user/MyDocs/Oe1"
+        local_file = os.path.join(download_dir, safe_title + u".mp3")
+        
+        if os.path.exists(local_file):
+            print u"Playing local file: %s" % local_file
+            self._playUrl = "file://" + local_file
+            self._streamDuration = 0
+            self.playUrlChanged.emit()
+            return
+        
+        # Keine lokale Datei - starte Proxy async
+        print u"No local file, starting async proxy: %s" % url[:60]
+        self._startProxyForPodcast(url)
+    
+    def _startProxyInThread(self, url):
+        """Start proxy completely in background thread"""
+        print u"[Main] Starting proxy thread..."
+        
+        def worker():
+            try:
+                # 1. Hole Content-Length (blockiert nur den Thread, nicht UI)
+                content_length = self._getContentLength(url)
+                
+                # 2. Starte Proxy mit korrekter Länge
+                port = self._startProxy(url, content_length)
+                self._pending['asyncPort'] = port
+                print u"[Thread] Proxy ready on port %d" % port
+            except Exception as e:
+                print u"[Thread] Proxy error: %s" % e
+                import traceback
+                traceback.print_exc()
+                self._pending['asyncPort'] = None
+        
+        t = threading.Thread(target=worker)
+        t.daemon = True
+        t.start()
+        
+        print u"[Main] Thread started, UI should stay responsive"
+        
+        def check():
+            if 'asyncPort' in self._pending:
+                port = self._pending.pop('asyncPort')
+                if port:
+                    self._playUrl = "http://127.0.0.1:%d/stream.mp3" % port
+                    print u"[Main] Playing from proxy port %d" % port
+                    self.playUrlChanged.emit()
+                else:
+                    self._errorMsg = "Proxy-Start fehlgeschlagen"
+                    self.errorOccurred.emit()
+            elif t.is_alive():
+                QTimer.singleShot(100, check)
+        
+        QTimer.singleShot(100, check)
+    
+    @Slot(str)
+    def startLiveProxy(self, liveUrl):
+        """Start proxy for livestream with timeshift capability"""
+        print u"Starting live proxy for: %s" % liveUrl
+        
+        # Stoppe alten Proxy
+        self._stopProxy()
+        
+        # Setze streamDuration auf 0 (wird dynamisch in QML berechnet)
+        self._streamDuration = 0
+        
+        # Starte Proxy für Livestream
+        import socket
+        import os
+        import time
+        
+        # Cache-Verzeichnis in MyDocs (hat genug Platz, /tmp ist nur 4MB!)
+        cache_dir = "/home/user/MyDocs/.oe1cache"
+        if not os.path.exists(cache_dir):
+            try:
+                os.makedirs(cache_dir)
+            except:
+                cache_dir = "/home/user/MyDocs"
+        
+        # Lösche alte Live-Cache-Dateien
+        for f in os.listdir(cache_dir):
+            if f.startswith('live_') and f.endswith('.mp3'):
+                try:
+                    os.remove(os.path.join(cache_dir, f))
+                except:
+                    pass
+        
+        # Temp-Datei für Live-Cache
+        self._proxyTempFile = os.path.join(cache_dir, "live_%d.mp3" % int(time.time()))
+        
+        # Starte Hintergrund-Download (läuft endlos für Livestream)
+        self._downloadProc = subprocess.Popen(
+            ['/opt/wunderw/bin/wget', '-q', '-O', self._proxyTempFile, liveUrl],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE
+        )
+        print u"Live cache started: %s" % self._proxyTempFile
+        
+        # Kurze Wartezeit auf erste Daten (max 2 sec)
+        for i in range(20):
+            time.sleep(0.1)
+            if os.path.exists(self._proxyTempFile):
+                size = os.path.getsize(self._proxyTempFile)
+                if size >= 100 * 1024:  # 100KB
+                    print u"Live buffer ready: %d bytes" % size
+                    break
+        
+        # Finde freien Port
+        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        sock.bind(('127.0.0.1', 0))
+        port = sock.getsockname()[1]
+        sock.listen(5)
+        
+        self._proxySocket = sock
+        self._proxyRunning = True
+        self._proxyContentLength = None  # Livestream hat keine feste Länge
+        
+        def handle_client(client):
+            """Handle client for live streaming"""
+            try:
+                request = ''
+                try:
+                    request = client.recv(4096)
+                except:
+                    pass
+                
+                range_start = 0
+                if 'Range:' in request:
+                    import re
+                    match = re.search(r'Range:\s*bytes=(\d+)-', request)
+                    if match:
+                        range_start = int(match.group(1))
+                        print u"Live seek to: %d" % range_start
+                
+                # Warte bis Datei groß genug
+                timeout = 100
+                while timeout > 0 and self._proxyRunning:
+                    if os.path.exists(self._proxyTempFile):
+                        size = os.path.getsize(self._proxyTempFile)
+                        if size > range_start + 50000:
+                            break
+                    time.sleep(0.05)
+                    timeout -= 1
+                
+                if not os.path.exists(self._proxyTempFile):
+                    return
+                
+                # HTTP Response ohne Content-Length (Chunked/Streaming)
+                if range_start > 0:
+                    header = "HTTP/1.1 206 Partial Content\r\n"
+                else:
+                    header = "HTTP/1.1 200 OK\r\n"
+                header += "Content-Type: audio/mpeg\r\n"
+                header += "Accept-Ranges: bytes\r\n"
+                header += "Connection: close\r\n\r\n"
+                client.sendall(header)
+                
+                # Stream aus Datei
+                with open(self._proxyTempFile, 'rb') as f:
+                    f.seek(range_start)
+                    
+                    while self._proxyRunning:
+                        # Warte auf mehr Daten
+                        wait_count = 0
+                        current_pos = f.tell()
+                        while self._proxyRunning and wait_count < 100:
+                            file_size = os.path.getsize(self._proxyTempFile)
+                            if file_size > current_pos + 1000:
+                                break
+                            time.sleep(0.05)
+                            wait_count += 1
+                        
+                        chunk = f.read(32768)
+                        if chunk:
+                            try:
+                                client.sendall(chunk)
+                            except:
+                                break
+                        else:
+                            time.sleep(0.05)
+                        
+            except Exception as e:
+                print u"Live client error: %s" % e
+            finally:
+                try:
+                    client.close()
+                except:
+                    pass
+        
+        def proxy_thread():
+            import select
+            sock.setblocking(False)
+            while self._proxyRunning:
+                try:
+                    ready, _, _ = select.select([sock], [], [], 0.5)
+                    if ready:
+                        client, _ = sock.accept()
+                        t = threading.Thread(target=handle_client, args=(client,))
+                        t.daemon = True
+                        t.start()
+                except:
+                    pass
+        
+        t = threading.Thread(target=proxy_thread)
+        t.daemon = True
+        t.start()
+        
+        print u"Live proxy on port %d" % port
+        
+        self._playUrl = "http://127.0.0.1:%d/stream.mp3" % port
+        self.playUrlChanged.emit()
+    
+    @Slot()
+    def startTimeshift(self):
+        """Start timeshift for current broadcast - enables seeking within current show"""
+        if self._currentBroadcastId > 0:
+            print u"Starting timeshift for: %d" % self._currentBroadcastId
+            self.getPlaybackUrl(self._currentBroadcastId)
+        else:
+            print u"No current broadcast ID available"
+            self._errorMsg = "Keine aktuelle Sendung verfügbar"
+            self.errorOccurred.emit()
+    
+    @Slot(result=int)
+    def getCurrentBroadcastId(self):
+        """Get current broadcast ID"""
+        return self._currentBroadcastId
+    
+    # ==================== BROADCAST INFO ====================
+    
+    @Slot(int)
+    def loadBroadcastInfo(self, broadcastId):
+        """Load detailed broadcast info"""
+        print u"Loading broadcast info for: %d" % broadcastId
+        
+        def worker():
+            try:
+                url = "%s/broadcast/%d" % (API_OE1, broadcastId)
+                data = self._fetchUrl(url)
+                if data:
+                    self._pending['broadcastInfo'] = data
+            except Exception as e:
+                print u"Broadcast info error: %s" % e
+                self._pending['broadcastInfo'] = None
+        
+        t = threading.Thread(target=worker)
+        t.daemon = True
+        t.start()
+        
+        def check():
+            if 'broadcastInfo' in self._pending:
+                data = self._pending.pop('broadcastInfo')
+                if data:
+                    self._handleBroadcastInfo(data)
+                else:
+                    self._broadcastInfoJson = '{}'
+                    self.broadcastInfoChanged.emit()
+            elif t.is_alive():
+                QTimer.singleShot(200, check)
+        
+        QTimer.singleShot(200, check)
+    
+    def _handleBroadcastInfo(self, data):
+        """Parse broadcast details"""
+        try:
+            response = json.loads(data)
+            
+            # API kann payload wrapper haben oder direkt das Objekt sein
+            if isinstance(response, dict):
+                if 'payload' in response:
+                    payload = response.get('payload', {})
+                    # payload kann auch direkt das Objekt sein oder eine Liste
+                    if isinstance(payload, list) and len(payload) > 0:
+                        payload = payload[0]
+                    elif not isinstance(payload, dict):
+                        payload = response
+                else:
+                    payload = response
+            else:
+                print u"Unexpected response type: %s" % type(response)
+                self._broadcastInfoJson = '{}'
+                self.broadcastInfoChanged.emit()
+                return
+            
+            # Basisinfos
+            title = payload.get('title', '') if isinstance(payload, dict) else ''
+            programTitle = ''
+            if isinstance(payload, dict):
+                programTitle = payload.get('programTitle', '')
+                if not programTitle:
+                    prog = payload.get('program', {})
+                    if isinstance(prog, dict):
+                        programTitle = prog.get('title', '')
+            
+            # Start/End Zeit
+            startStr = payload.get('start', '') if isinstance(payload, dict) else ''
+            endStr = payload.get('end', '') if isinstance(payload, dict) else ''
+            startTime = ''
+            endTime = ''
+            if startStr:
+                start = datetime.strptime(startStr[:19], '%Y-%m-%dT%H:%M:%S')
+                start = start + timedelta(hours=1)  # UTC -> CET
+                startTime = start.strftime('%H:%M')
+            if endStr:
+                end = datetime.strptime(endStr[:19], '%Y-%m-%dT%H:%M:%S')
+                end = end + timedelta(hours=1)
+                endTime = end.strftime('%H:%M')
+            
+            # Beschreibung
+            description = ''
+            if isinstance(payload, dict):
+                description = payload.get('description', '') or payload.get('subtitle', '') or ''
+            
+            # Moderator/Presenter
+            moderator = ''
+            if isinstance(payload, dict):
+                presenters = payload.get('presenters', [])
+                if isinstance(presenters, list):
+                    names = []
+                    for p in presenters:
+                        if isinstance(p, dict) and p.get('name'):
+                            names.append(p.get('name'))
+                    moderator = ', '.join(names)
+            
+            # Themen/Items
+            topics = []
+            if isinstance(payload, dict):
+                items = payload.get('items', [])
+                if isinstance(items, list):
+                    for item in items[:10]:
+                        if isinstance(item, dict):
+                            itemTitle = item.get('title', '')
+                            if itemTitle:
+                                topics.append(itemTitle)
+            
+            # hasStream Check
+            hasStream = False
+            if isinstance(payload, dict):
+                streams = payload.get('streams', [])
+                hasStream = isinstance(streams, list) and len(streams) > 0
+            
+            info = {
+                'title': title,
+                'programTitle': programTitle,
+                'startTime': startTime,
+                'endTime': endTime,
+                'description': description,
+                'moderator': moderator,
+                'topics': topics,
+                'hasStream': hasStream
+            }
+            
+            print u"Broadcast info loaded: %s" % title
+            self._broadcastInfoJson = json.dumps(info)
+            self.broadcastInfoChanged.emit()
+            
+        except Exception as e:
+            print u"Parse broadcast info error: %s" % e
+            self._broadcastInfoJson = '{}'
+            self.broadcastInfoChanged.emit()
+    
+    # ==================== PODCASTS ====================
+    
+    @Slot()
+    def loadPodcasts(self):
+        """Load available podcasts"""
+        print u"Loading podcasts..."
+        
+        def worker():
+            try:
+                url = "%s/podcasts" % API_RADIOTHEK
+                data = self._fetchUrl(url)
+                if data:
+                    self._pending['podcasts'] = data
+            except Exception as e:
+                print u"Podcasts error: %s" % e
+        
+        t = threading.Thread(target=worker)
+        t.daemon = True
+        t.start()
+        
+        def check():
+            if 'podcasts' in self._pending:
+                data = self._pending.pop('podcasts')
+                self._handlePodcasts(data)
+            elif t.is_alive():
+                QTimer.singleShot(200, check)
+        
+        QTimer.singleShot(200, check)
+    
+    def _handlePodcasts(self, data):
+        """Parse podcasts list"""
+        try:
+            response = json.loads(data)
+            payload = response.get('payload', {})
+            oe1_podcasts = payload.get('oe1', [])
+            
+            items = []
+            for p in oe1_podcasts[:40]:
+                item = {
+                    'id': p.get('id', 0),
+                    'title': p.get('title', ''),
+                    'subtitle': p.get('description', '')[:80] if p.get('description') else ''
+                }
+                items.append(item)
+            
+            print u"Found %d podcasts" % len(items)
+            self._podcastsJson = json.dumps(items)
+            self.podcastsChanged.emit()
+            
+        except Exception as e:
+            print u"Parse podcasts error: %s" % e
+            self._podcastsJson = '[]'
+            self.podcastsChanged.emit()
+    
+    @Slot(int)
+    def loadPodcastEpisodes(self, podcastId):
+        """Load episodes for a podcast via RSS feed"""
+        print u"Loading podcast episodes: %d" % podcastId
+        self._currentPodcastId = podcastId
+        
+        def worker():
+            try:
+                # Hole Podcast-Details für Feed-URL
+                url = "%s/podcast/%d" % (API_RADIOTHEK, podcastId)
+                data = self._fetchUrl(url)
+                if data:
+                    response = json.loads(data)
+                    payload = response.get('payload', {})
+                    urls = payload.get('urls', {})
+                    feed_url = urls.get('feed', '')
+                    podcast_title = payload.get('title', '')
+                    
+                    if feed_url:
+                        print u"Fetching RSS for '%s': %s" % (podcast_title, feed_url)
+                        rss_data = self._fetchUrl(feed_url)
+                        if rss_data:
+                            self._pending['episodes'] = ('rss', rss_data, podcastId)
+                            return
+                
+                self._pending['episodes'] = ('empty', '[]', podcastId)
+            except Exception as e:
+                print u"Episodes error: %s" % e
+                self._pending['episodes'] = ('empty', '[]', podcastId)
+        
+        t = threading.Thread(target=worker)
+        t.daemon = True
+        t.start()
+        
+        def check():
+            if 'episodes' in self._pending:
+                ep_type, data, pid = self._pending.pop('episodes')
+                if ep_type == 'rss':
+                    self._handleRssEpisodes(data)
+                else:
+                    self._episodesJson = '[]'
+                    self.podcastEpisodesChanged.emit()
+            elif t.is_alive():
+                QTimer.singleShot(200, check)
+        
+        QTimer.singleShot(200, check)
+    
+    def _handleBroadcastEpisodes(self, data):
+        """Unused - kept for compatibility"""
+        self._episodesJson = '[]'
+        self.podcastEpisodesChanged.emit()
+    
+    def _handleRssEpisodes(self, rss_data):
+        """Parse podcast episodes from RSS feed - use HTTP for MP3s"""
+        import re
+        import os
+        try:
+            items = []
+            download_dir = u"/home/user/MyDocs/Oe1"
+            
+            # Stelle sicher dass rss_data Unicode ist
+            if isinstance(rss_data, str):
+                rss_data = rss_data.decode('utf-8', 'ignore')
+            
+            # Finde alle <item> Blöcke
+            item_blocks = re.findall(r'<item>(.*?)</item>', rss_data, re.DOTALL)
+            
+            for block in item_blocks[:20]:
+                # Titel
+                title_match = re.search(r'<title>([^<]+)</title>', block)
+                title = title_match.group(1) if title_match else u''
+                
+                # MP3 URL aus enclosure
+                enc_match = re.search(r'enclosure[^>]*url="([^"]+)"', block)
+                mp3_url = enc_match.group(1) if enc_match else ''
+                # XML entity decode
+                if mp3_url:
+                    mp3_url = mp3_url.replace('&amp;', '&')
+                
+                # Datum
+                date_match = re.search(r'<pubDate>([^<]+)</pubDate>', block)
+                date_str = ''
+                if date_match:
+                    try:
+                        parts = date_match.group(1).split()
+                        if len(parts) >= 4:
+                            day = parts[1]
+                            months = {'Jan':'01','Feb':'02','Mar':'03','Apr':'04','May':'05','Jun':'06',
+                                      'Jul':'07','Aug':'08','Sep':'09','Oct':'10','Nov':'11','Dec':'12'}
+                            mon = months.get(parts[2], '01')
+                            date_str = "%s.%s." % (day, mon)
+                    except:
+                        pass
+                
+                # Prüfe ob heruntergeladen
+                downloaded = False
+                if title and os.path.exists(download_dir):
+                    try:
+                        safe_title = title.replace(u'/', u'-').replace(u':', u'-').replace(u'?', u'').replace(u'"', u'')
+                        safe_title = safe_title.replace(u'ä', u'ae').replace(u'ö', u'oe').replace(u'ü', u'ue')
+                        safe_title = safe_title.replace(u'Ä', u'Ae').replace(u'Ö', u'Oe').replace(u'Ü', u'Ue')
+                        safe_title = safe_title.replace(u'ß', u'ss')
+                        local_file = os.path.join(download_dir, safe_title + u".mp3")
+                        if os.path.exists(local_file):
+                            downloaded = True
+                    except:
+                        pass
+                
+                if title and mp3_url:
+                    print u"RSS episode: %s -> %s" % (title[:30], mp3_url)
+                    items.append({
+                        'id': 0,
+                        'title': title,
+                        'date': date_str,
+                        'url': mp3_url,
+                        'downloaded': downloaded
+                    })
+            
+            print u"Found %d episodes from RSS" % len(items)
+            self._episodesJson = json.dumps(items)
+            self.podcastEpisodesChanged.emit()
+            
+        except Exception as e:
+            print u"Parse RSS error: %s" % e
+            self._episodesJson = '[]'
+            self.podcastEpisodesChanged.emit()
+    
+    def _handleEpisodes(self, data):
+        """Parse podcast episodes from JSON (fallback)"""
+        try:
+            response = json.loads(data)
+            payload = response.get('payload', {})
+            episodes = payload.get('episodes', [])
+            
+            items = []
+            for e in episodes[:20]:
+                item = {
+                    'id': e.get('id', 0),
+                    'title': e.get('title', ''),
+                    'date': e.get('published', '')[:10] if e.get('published') else '',
+                    'url': ''
+                }
+                items.append(item)
+            
+            print u"Found %d episodes" % len(items)
+            self._episodesJson = json.dumps(items)
+            self.podcastEpisodesChanged.emit()
+            
+        except Exception as e:
+            print u"Parse episodes error: %s" % e
+            self._episodesJson = '[]'
+            self.podcastEpisodesChanged.emit()
+    
+    # ==================== SEARCH ====================
+    
+    @Slot(str)
+    def search(self, query):
+        """Search broadcasts"""
+        if len(query) < 2:
+            return
+        
+        print u"Searching: %s" % query
+        
+        def worker():
+            try:
+                results = []
+                query_lower = query.lower()
+                
+                for i in range(7):
+                    d = datetime.now() - timedelta(days=i)
+                    date = d.strftime('%Y%m%d')
+                    
+                    if date in self._broadcastCache:
+                        data = self._broadcastCache[date]
+                    else:
+                        url = "%s/broadcasts/%s" % (API_OE1, date)
+                        data = self._fetchUrl(url)
+                        if data:
+                            self._broadcastCache[date] = data
+                    
+                    if data:
+                        response = json.loads(data)
+                        broadcasts = response.get('payload', [])
+                        
+                        for b in broadcasts:
+                            title = b.get('title', '').lower()
+                            programTitle = (b.get('programTitle', '') or '').lower()
+                            
+                            if query_lower in title or query_lower in programTitle:
+                                if b.get('isOnDemand', False):
+                                    startStr = b.get('start', '')
+                                    start = datetime.strptime(startStr[:19], '%Y-%m-%dT%H:%M:%S') if startStr else None
+                                    
+                                    item = {
+                                        'id': b.get('id', 0),
+                                        'title': b.get('title', ''),
+                                        'subtitle': b.get('programTitle', '') or '',
+                                        'date': start.strftime('%d.%m.') if start else '',
+                                        'time': start.strftime('%H:%M') if start else '',
+                                        'hasStream': True  # Nur OnDemand-Sendungen werden gefunden
+                                    }
+                                    results.append(item)
+                                    
+                                    if len(results) >= 25:
+                                        break
+                    
+                    if len(results) >= 25:
+                        break
+                
+                print u"Search found %d results" % len(results)
+                self._pending['search'] = json.dumps(results)
+                
+            except Exception as e:
+                print u"Search error: %s" % e
+                self._pending['search'] = '[]'
+        
+        t = threading.Thread(target=worker)
+        t.daemon = True
+        t.start()
+        
+        def check():
+            if 'search' in self._pending:
+                data = self._pending.pop('search')
+                self._resultsJson = data
+                self.searchResultsChanged.emit()
+            elif t.is_alive():
+                QTimer.singleShot(200, check)
+        
+        QTimer.singleShot(200, check)
+    
+    # ==================== DOWNLOAD ====================
+    
+    def _checkDownloadProgress(self):
+        """Check download progress"""
+        import os
+        if not self._saveDownloadActive:
+            self.downloadTimer.stop()
+            return
+        
+        if self._saveDownloadProc and self._saveDownloadProc.poll() is not None:
+            # Download fertig
+            self._saveDownloadActive = False
+            self.downloadTimer.stop()
+            
+            if os.path.exists(self._saveDownloadFile):
+                size = os.path.getsize(self._saveDownloadFile)
+                if size > 0:
+                    self._saveDownloadProgress = 100
+                    print u"Download complete: %s (%d bytes)" % (self._saveDownloadFile, size)
+                    self.downloadFinished.emit()
+                else:
+                    print u"Download failed: empty file"
+                    self._errorMsg = "Download fehlgeschlagen"
+                    self.errorOccurred.emit()
+            else:
+                print u"Download failed: file not found"
+                self._errorMsg = "Download fehlgeschlagen"
+                self.errorOccurred.emit()
+            
+            self._saveDownloadProc = None
+            self.downloadProgressChanged.emit()
+            return
+        
+        # Progress berechnen
+        if self._saveDownloadSize > 0 and os.path.exists(self._saveDownloadFile):
+            current = os.path.getsize(self._saveDownloadFile)
+            self._saveDownloadProgress = int(100 * current / self._saveDownloadSize)
+            self.downloadProgressChanged.emit()
+    
+    @Slot(str, str)
+    def downloadFile(self, url, filename):
+        """Download file to MyDocs/Oe1 (without broadcast ID)"""
+        self._downloadFileInternal(url, filename, 0)
+    
+    def downloadFileWithId(self, url, filename, broadcastId):
+        """Download file to MyDocs/Oe1 with broadcast ID prefix"""
+        self._downloadFileInternal(url, filename, broadcastId)
+    
+    def _downloadFileInternal(self, url, filename, broadcastId):
+        """Download file to MyDocs/Oe1"""
+        import os
+        
+        # Stoppe laufenden Download
+        if self._saveDownloadActive:
+            self.cancelDownload()
+        
+        # Erstelle Zielverzeichnis (Unicode!)
+        download_dir = u"/home/user/MyDocs/Oe1"
+        if not os.path.exists(download_dir):
+            try:
+                os.makedirs(download_dir)
+            except:
+                download_dir = u"/home/user/MyDocs"
+        
+        # Bereinige Dateinamen (als Unicode)
+        if isinstance(filename, str):
+            filename = filename.decode('utf-8', 'ignore')
+        safe_name = filename.replace(u'/', u'-').replace(u':', u'-').replace(u'?', u'').replace(u'"', u'')
+        # Ersetze Umlaute für sichereren Dateinamen
+        safe_name = safe_name.replace(u'ä', u'ae').replace(u'ö', u'oe').replace(u'ü', u'ue')
+        safe_name = safe_name.replace(u'Ä', u'Ae').replace(u'Ö', u'Oe').replace(u'Ü', u'Ue')
+        safe_name = safe_name.replace(u'ß', u'ss')
+        
+        # Mit BroadcastID prefix wenn vorhanden
+        if broadcastId > 0:
+            safe_name = u"%d_%s" % (broadcastId, safe_name)
+        
+        if not safe_name.endswith(u'.mp3'):
+            safe_name += u'.mp3'
+        
+        self._saveDownloadFile = os.path.join(download_dir, safe_name)
+        
+        print u"Starting download: %s" % self._saveDownloadFile
+        
+        # Hole Dateigröße
+        self._saveDownloadSize = 0
+        try:
+            proc = subprocess.Popen(
+                ['/opt/wunderw/bin/wget', '--spider', '-S', '--timeout=10', url],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE
+            )
+            _, stderr = proc.communicate()
+            for line in stderr.split('\n'):
+                line_lower = line.lower()
+                if 'content-length:' in line_lower:
+                    parts = line.split(':')
+                    if len(parts) > 1:
+                        try:
+                            self._saveDownloadSize = int(parts[1].strip().split()[0])
+                        except:
+                            pass
+                        break
+        except:
+            pass
+        
+        # Starte Download
+        self._saveDownloadProc = subprocess.Popen(
+            ['/opt/wunderw/bin/wget', '-q', '-O', self._saveDownloadFile, url],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE
+        )
+        
+        self._saveDownloadActive = True
+        self._saveDownloadProgress = 0
+        self.downloadProgressChanged.emit()
+        
+        # Starte Progress-Timer
+        self.downloadTimer.start(500)
+    
+    @Slot(int)
+    def downloadBroadcast(self, broadcastId):
+        """Download 7-Tage broadcast"""
+        print u"Downloading broadcast: %d" % broadcastId
+        
+        def worker():
+            try:
+                # Hole Broadcast-Details (gleiche URL wie getPlaybackUrl)
+                url = "%s/broadcast/%d" % (API_OE1, broadcastId)
+                print u"Fetching broadcast info from: %s" % url
+                data = self._fetchUrl(url)
+                if data:
+                    print u"Got broadcast data, length: %d" % len(data)
+                    self._pending['downloadBroadcast'] = (broadcastId, data)
+                else:
+                    print u"No data returned from API"
+                    self._pending['downloadBroadcast'] = None
+            except Exception as e:
+                print u"Download broadcast error: %s" % e
+                self._pending['downloadBroadcast'] = None
+        
+        t = threading.Thread(target=worker)
+        t.daemon = True
+        t.start()
+        
+        def check():
+            if 'downloadBroadcast' in self._pending:
+                result = self._pending.pop('downloadBroadcast')
+                if result:
+                    broadcastId, data = result
+                    self._handleDownloadBroadcast(broadcastId, data)
+                else:
+                    print u"Download check: no result"
+                    self._errorMsg = "Keine Stream-Daten"
+                    self.errorOccurred.emit()
+            elif t.is_alive():
+                QTimer.singleShot(200, check)
+            else:
+                print u"Download check: thread finished without result"
+        
+        QTimer.singleShot(200, check)
+    
+    def _handleDownloadBroadcast(self, broadcastId, data):
+        """Parse stream info and start download"""
+        try:
+            print u"Parsing download data for broadcast %d" % broadcastId
+            response = json.loads(data)
+            payload = response.get('payload', {})
+            if isinstance(payload, list) and len(payload) > 0:
+                payload = payload[0]
+            
+            # Finde loopstream URL
+            streams = payload.get('streams', [])
+            mp3_url = None
+            for s in streams:
+                if isinstance(s, dict) and 'loopStreamId' in s:
+                    loop_id = s.get('loopStreamId', '')
+                    if loop_id:
+                        # HTTP statt HTTPS (loopstream akzeptiert beides)
+                        mp3_url = "https://loopstream01.apa.at/?channel=oe1&id=%s" % loop_id
+                        print u"Found loopstream: %s" % loop_id
+                        break
+            
+            if mp3_url:
+                # Hole Titel aus Cache oder payload
+                title = payload.get('title', '') or "oe1_broadcast_%d" % broadcastId
+                print u"Starting download: %s -> %s" % (mp3_url[:50], title)
+                self.downloadFileWithId(mp3_url, title, broadcastId)
+            else:
+                print u"No stream found in payload"
+                self._errorMsg = "Kein Stream verfügbar"
+                self.errorOccurred.emit()
+                
+        except Exception as e:
+            print u"Handle download broadcast error: %s" % e
+            import traceback
+            traceback.print_exc()
+            self._errorMsg = "Download-Fehler"
+            self.errorOccurred.emit()
+    
+    @Slot(str, str)
+    def downloadPodcastEpisode(self, url, title):
+        """Download podcast episode"""
+        print u"Downloading podcast: %s" % title
+        
+        # HTTPS zu HTTP (Server unterstützt beides)
+        if url.startswith('https://'):
+            url = url.replace('https://', 'http://')
+        
+        self.downloadFile(url, title)
+    
+    @Slot()
+    def cancelDownload(self):
+        """Cancel active download"""
+        import os
+        
+        print u"cancelDownload called, active=%s" % self._saveDownloadActive
+        
+        if self._saveDownloadProc:
+            try:
+                self._saveDownloadProc.terminate()
+                self._saveDownloadProc.wait()
+            except:
+                pass
+            self._saveDownloadProc = None
+        
+        # Lösche unvollständige Datei
+        if self._saveDownloadFile and os.path.exists(self._saveDownloadFile):
+            try:
+                os.remove(self._saveDownloadFile)
+            except:
+                pass
+        
+        self._saveDownloadActive = False
+        self._saveDownloadProgress = 0
+        self._saveDownloadFile = ''
+        self.downloadTimer.stop()
+        self.downloadProgressChanged.emit()
+        print u"Download cancelled"
+    
+    # ==================== SLEEP TIMER ====================
+    
+    @Slot(int)
+    def startSleepTimer(self, minutes):
+        self._sleepTimerRemaining = minutes * 60
+        self.sleepTimer.start(1000)
+        print u"Sleep timer: %d min" % minutes
+    
+    @Slot()
+    def stopSleepTimer(self):
+        self.sleepTimer.stop()
+        self._sleepTimerRemaining = 0
+    
+    @Slot(result=int)
+    def getSleepTimerRemaining(self):
+        return self._sleepTimerRemaining
+    
+    def _sleepTimerUpdate(self):
+        self._sleepTimerRemaining -= 1
+        self._timerRemaining = self._sleepTimerRemaining
+        self.sleepTimerTick.emit()
+        
+        if self._sleepTimerRemaining <= 0:
+            self.sleepTimer.stop()
+            self.sleepTimerFinished.emit()
+    
+    @Slot(str, result=str)
+    def getStreamUrl(self, quality):
+        return STREAM_URLS.get(quality, STREAM_URLS['low'])
+
+
+def main():
+    print u"=== Ö1 Radio 1.5.43 Starting ==="
+    
+    app = QApplication(sys.argv)
+    app.setApplicationName("Oe1Radio")
+    
+    view = QDeclarativeView()
+    view.setWindowTitle(u"Ö1 Radio")
+    
+    helper = Oe1Helper()
+    view.rootContext().setContextProperty("oe1", helper)
+    
+    qml_path = "/opt/oe1-radio/qml/main.qml"
+    print u"Loading QML from: %s" % qml_path
+    view.setSource(QUrl.fromLocalFile(qml_path))
+    
+    if view.status() == QDeclarativeView.Error:
+        print u"QML Error!"
+        for error in view.errors():
+            print u"  %s" % error.toString()
+        return 1
+    
+    view.showFullScreen()
+    
+    return app.exec_()
+
+
+if __name__ == "__main__":
+    sys.exit(main())

@@ -1,0 +1,11 @@
+[Desktop Entry]
+Encoding=UTF-8
+Version=1.0
+Type=Application
+Name=Ö1 Radio
+Comment=Ö1 Radio für MeeGo Harmattan
+Exec=/opt/oe1-radio/oe1radio
+Icon=/usr/share/icons/hicolor/80x80/apps/oe1-radio.png
+Terminal=false
+Categories=Audio;Music;
+X-MeeGo-Touch-Type=Application
